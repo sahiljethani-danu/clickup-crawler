@@ -1,7 +1,8 @@
-import { ClickUpClient, ClickUpDocument } from "./clickup-client";
-import { mkdir, writeFile } from "fs/promises";
+import { ClickUpClient, ClickUpDocument, ClickUpList } from "./clickup-client";
+import { mkdir, writeFile, appendFile } from "fs/promises";
 import { join } from "path";
 import { existsSync } from "fs";
+import { objectsToCSV, objectToCSVRow, getFieldNames, escapeCSV } from "./csv-utils";
 
 interface ClickUpPage {
   id: string;
@@ -306,66 +307,187 @@ export class ClickUpCrawler {
     }
   }
 
-  async crawlSpace(spaceId: string, spaceName: string, workspaceId: string): Promise<void> {
-    if (!workspaceId) {
-      throw new Error("Workspace ID is required to fetch document content");
-    }
-
-    console.log(`\nCrawling space: ${spaceName} (${spaceId})`);
+  private async exportTasksAsCSV(spaceId: string, spacePath: string, spaceName: string): Promise<void> {
+    const csvPath = join(spacePath, `tasks.csv`);
+    let headerWritten = false;
+    let allFieldNames = new Set<string>();
+    let taskCount = 0;
 
     try {
-      // Get all documents in the space (checks space, views, folders, and lists)
-      console.log(`  Searching for documents...`);
-      const result = await this.client.getDocuments(spaceId, workspaceId);
-      const documents = result.documents || [];
+      console.log(`  Fetching tasks...`);
 
-      if (documents.length === 0) {
-        console.log(`  ℹ️  No documents found in this space`);
+      // Create a callback function to write tasks incrementally
+      const writeTask = async (task: any) => {
+        const taskFields = getFieldNames(task);
+        const fieldsBefore = new Set(allFieldNames);
+
+        // Merge new fields into the set of all fields
+        taskFields.forEach(field => allFieldNames.add(field));
+
+        // Check if we discovered new fields
+        const hasNewFields = Array.from(allFieldNames).some(field => !fieldsBefore.has(field));
+
+        // Write or update header
+        if (!headerWritten) {
+          // First task - write header
+          const sortedFields = Array.from(allFieldNames).sort();
+          const header = sortedFields.map(escapeCSV).join(",");
+          await writeFile(csvPath, header + "\n", "utf-8");
+          headerWritten = true;
+        } else if (hasNewFields) {
+          // New fields discovered - update header by reading current file, updating header, and rewriting
+          // Note: This is a compromise - we read the file but don't keep tasks in memory
+          const fs = await import("fs/promises");
+          const currentContent = await fs.readFile(csvPath, "utf-8");
+          const lines = currentContent.split("\n");
+          const sortedFields = Array.from(allFieldNames).sort();
+          const newHeader = sortedFields.map(escapeCSV).join(",");
+          // Replace first line (header) with new header
+          lines[0] = newHeader;
+          await writeFile(csvPath, lines.join("\n") + "\n", "utf-8");
+        }
+
+        // Write task row with all known fields (missing fields will be empty)
+        // This ensures all rows have the same number of columns
+        const sortedFields = Array.from(allFieldNames).sort();
+        const row = objectToCSVRow(task, sortedFields);
+        await appendFile(csvPath, row + "\n", "utf-8");
+
+        taskCount++;
+      };
+
+      // Fetch tasks and write them incrementally
+      await this.client.getAllTasksInSpace(spaceId, writeTask);
+
+      if (taskCount === 0) {
+        console.log(`  ℹ️  No tasks found in this space`);
+        // Remove empty file if no tasks
+        if (headerWritten) {
+          await writeFile(csvPath, "", "utf-8");
+        }
         return;
       }
 
-      console.log(`  ✓ Found ${documents.length} document(s)`);
+      console.log(`  ✓ Found and saved ${taskCount} task(s) to ${csvPath}`);
+    } catch (error) {
+      console.error(`  Error exporting tasks: ${error}`);
+      // Don't throw - continue with other exports
+    }
+  }
 
-      // Fetch full content for each document
-      const documentsWithContent: ClickUpDocument[] = [];
-      for (const doc of documents) {
-        try {
-          const { document, pages } = await this.client.getDocument(doc.id, workspaceId);
-          document.pages = pages;
-          documentsWithContent.push(document);
-          console.log(`  Fetched: ${document.name} (${pages.length} page(s))`);
-          // Small delay to respect rate limits (100 requests/minute = ~600ms between requests)
-          await this.delay(600);
-        } catch (error) {
-          console.error(`  Error fetching document ${doc.id}: ${error}`);
-          throw error; // Re-throw to fail fast
+  private async exportListsAsCSV(spaceId: string, spacePath: string, spaceName: string): Promise<void> {
+    try {
+      console.log(`  Fetching task lists...`);
+      const allLists: ClickUpList[] = [];
+
+      // Get lists directly in space
+      try {
+        const { lists: spaceLists } = await this.client.getListsInSpace(spaceId);
+        allLists.push(...spaceLists);
+      } catch (error) {
+        console.error(`  Error fetching space lists: ${error}`);
+      }
+
+      // Get lists in folders
+      try {
+        const { folders } = await this.client.getFolders(spaceId);
+        for (const folder of folders) {
+          try {
+            const { lists } = await this.client.getLists(folder.id);
+            allLists.push(...lists);
+          } catch (error) {
+            console.error(`  Error fetching lists from folder ${folder.id}: ${error}`);
+          }
+        }
+      } catch (error) {
+        // Folders endpoint failed, continue
+      }
+
+      if (allLists.length === 0) {
+        console.log(`  ℹ️  No task lists found in this space`);
+        return;
+      }
+
+      console.log(`  ✓ Found ${allLists.length} task list(s)`);
+
+      // Save lists as CSV
+      const csvContent = objectsToCSV(allLists);
+      const csvPath = join(spacePath, `task_lists.csv`);
+      await writeFile(csvPath, csvContent, "utf-8");
+      console.log(`  ✓ Saved task lists to ${csvPath}`);
+    } catch (error) {
+      console.error(`  Error exporting task lists: ${error}`);
+      // Don't throw - continue with other exports
+    }
+  }
+
+  async crawlSpace(spaceId: string, spaceName: string, workspaceId: string, includeDocs: boolean = true, includeTasks: boolean = false): Promise<void> {
+    if (!workspaceId && includeDocs) {
+      throw new Error("Workspace ID is required to fetch document content");
+    }
+
+    console.log(`\nCrawling space: \x1b[34m${spaceName}\x1b[0m (${spaceId})`);
+
+    // Create space directory
+    const spaceDirName = this.sanitizeFileName(spaceName);
+    const spacePath = join(this.outputDir, spaceDirName);
+    await this.ensureDirectory(spacePath);
+
+    try {
+      // Export tasks and task lists as CSV if requested
+      if (includeTasks) {
+        await this.exportTasksAsCSV(spaceId, spacePath, spaceName);
+        await this.exportListsAsCSV(spaceId, spacePath, spaceName);
+      }
+
+      // Get all documents in the space if requested
+      if (includeDocs) {
+        console.log(`  Searching for documents...`);
+        const result = await this.client.getDocuments(spaceId, workspaceId);
+        const documents = result.documents || [];
+
+        if (documents.length === 0) {
+          console.log(`  ℹ️  No documents found in this space`);
+        } else {
+          console.log(`  ✓ Found ${documents.length} document(s)`);
+
+          // Fetch full content for each document
+          const documentsWithContent: ClickUpDocument[] = [];
+          for (const doc of documents) {
+            try {
+              const { document, pages } = await this.client.getDocument(doc.id, workspaceId);
+              document.pages = pages;
+              documentsWithContent.push(document);
+              console.log(`  Fetched: ${document.name} (${pages.length} page(s))`);
+              // Small delay to respect rate limits (100 requests/minute = ~600ms between requests)
+              await this.delay(600);
+            } catch (error) {
+              console.error(`  Error fetching document ${doc.id}: ${error}`);
+              throw error; // Re-throw to fail fast
+            }
+          }
+
+          // Build document tree
+          const rootNodes = this.buildDocumentTree(documentsWithContent);
+
+          // Process each root document (now saves pages separately)
+          for (const rootNode of rootNodes) {
+            // Convert ClickUpDocument to DocumentNode for compatibility
+            const node: DocumentNode = {
+              id: rootNode.id,
+              name: rootNode.name,
+              type: rootNode.type,
+              content: rootNode.content,
+              children: rootNode.children,
+              parentId: rootNode.parentId,
+              pages: documentsWithContent.find(d => d.id === rootNode.id)?.pages
+            };
+            await this.processDocumentNode(node, spacePath, spaceName);
+          }
         }
       }
-
-      // Build document tree
-      const rootNodes = this.buildDocumentTree(documentsWithContent);
-
-      // Create space directory
-      const spaceDirName = this.sanitizeFileName(spaceName);
-      const spacePath = join(this.outputDir, spaceDirName);
-      await this.ensureDirectory(spacePath);
-
-      // Process each root document (now saves pages separately)
-      for (const rootNode of rootNodes) {
-        // Convert ClickUpDocument to DocumentNode for compatibility
-        const node: DocumentNode = {
-          id: rootNode.id,
-          name: rootNode.name,
-          type: rootNode.type,
-          content: rootNode.content,
-          children: rootNode.children,
-          parentId: rootNode.parentId,
-          pages: documentsWithContent.find(d => d.id === rootNode.id)?.pages
-        };
-        await this.processDocumentNode(node, spacePath, spaceName);
-      }
     } catch (error) {
-      console.error(`Error crawling space ${spaceName}: ${error}`);
+      console.error(`Error crawling space \x1b[34m${spaceName}\x1b[0m: ${error}`);
       throw error;
     }
   }

@@ -113,9 +113,12 @@ export class ClickUpClient {
 
         if (!response.ok) {
             const errorText = await response.text();
-            throw new Error(
+            const error = new Error(
                 `ClickUp API error: ${response.status} ${response.statusText} - ${errorText}`
-            );
+            ) as any;
+            error.status = response.status;
+            error.isRateLimit = response.status === 429;
+            throw error;
         }
 
         const data = await response.json();
@@ -154,9 +157,16 @@ export class ClickUpClient {
         }
     }
 
-    async getTasks(listId: string): Promise<any> {
+    async getTasks(listId: string, includeSubtasks: boolean = true): Promise<any> {
         try {
-            return await this.request(`/list/${listId}/task?archived=false`);
+            // Use query parameters to get as much data as possible in bulk
+            let url = `/list/${listId}/task?archived=false&include_closed=true`;
+            if (includeSubtasks) {
+                url += `&subtasks=true`;
+            }
+            // Try to include more fields - these parameters may vary by API version
+            url += `&include_markdown_description=true`;
+            return await this.request(url);
         } catch {
             return { tasks: [] };
         }
@@ -164,9 +174,148 @@ export class ClickUpClient {
 
     async getTask(taskId: string): Promise<any> {
         try {
-            return await this.request(`/task/${taskId}`);
+            // Fetch task with all available details
+            const task = await this.request(`/task/${taskId}?include_subtasks=true&include_markdown_description=true`);
+            return task;
         } catch {
             return null;
+        }
+    }
+
+    async getAllTasksInSpace(spaceId: string, onTask?: (task: any) => Promise<void>): Promise<void> {
+        let totalListsProcessed = 0;
+        let totalTasksProcessed = 0;
+
+        try {
+            // Get all lists in the space (both in folders and directly in space)
+            const { lists: spaceLists } = await this.getListsInSpace(spaceId);
+            const totalLists = spaceLists.length;
+
+            for (const list of spaceLists) {
+                try {
+                    // Use bulk API with query parameters to get as much data as possible
+                    const { tasks } = await this.getTasks(list.id, true);
+                    if (tasks && Array.isArray(tasks)) {
+                        const listTaskCount = tasks.length;
+                        // Tasks from list endpoint may already have most data, but check if we need individual fetches
+                        // Only fetch individual tasks if they're missing critical fields
+                        for (let taskIndex = 0; taskIndex < tasks.length; taskIndex++) {
+                            const task = tasks[taskIndex];
+
+                            // Check if task has all the data we need (subtasks, description, etc.)
+                            const needsFullFetch = !task.subtasks || !task.description || !task.markdown_description;
+
+                            let finalTask = task;
+                            if (needsFullFetch) {
+                                try {
+                                    const fullTaskResponse = await this.getTask(task.id);
+                                    // Handle both wrapped and unwrapped responses
+                                    finalTask = fullTaskResponse?.task || fullTaskResponse || task;
+                                    totalTasksProcessed++;
+
+                                    // Small delay to respect rate limits
+                                    await new Promise(resolve => setTimeout(resolve, 100));
+                                } catch (error: any) {
+                                    // Check if this is a rate limit error
+                                    if (error.isRateLimit) {
+                                        console.log(`⚠️  Rate limited! Lists: ${totalListsProcessed}/${totalLists}, List: ${list.name}, Tasks in list: ${taskIndex + 1}/${listTaskCount}, Total processed: ${totalTasksProcessed}`);
+                                    }
+                                    // If full task fetch fails, use the bulk task data
+                                    finalTask = task;
+                                    totalTasksProcessed++;
+                                }
+                            } else {
+                                // Use the bulk task data directly - it has everything we need
+                                totalTasksProcessed++;
+                            }
+
+                            // Call callback if provided, otherwise just process
+                            if (onTask && finalTask) {
+                                await onTask(finalTask);
+                            }
+                        }
+                    }
+                    totalListsProcessed++;
+                } catch (error: any) {
+                    if (error.isRateLimit) {
+                        console.log(`⚠️  Rate limited! Lists: ${totalListsProcessed}/${totalLists}, List: ${list.name}, Total processed: ${totalTasksProcessed}`);
+                    }
+                    console.error(`Error fetching tasks from list ${list.id}: ${error}`);
+                }
+            }
+
+            // Also get tasks from lists in folders
+            try {
+                const { folders } = await this.getFolders(spaceId);
+                for (const folder of folders) {
+                    try {
+                        const { lists } = await this.getLists(folder.id);
+                        for (const list of lists) {
+                            try {
+                                // Use bulk API with query parameters to get as much data as possible
+                                const { tasks } = await this.getTasks(list.id, true);
+                                if (tasks && Array.isArray(tasks)) {
+                                    const listTaskCount = tasks.length;
+                                    // Tasks from list endpoint may already have most data, but check if we need individual fetches
+                                    for (let taskIndex = 0; taskIndex < tasks.length; taskIndex++) {
+                                        const task = tasks[taskIndex];
+
+                                        // Check if task has all the data we need (subtasks, description, etc.)
+                                        const needsFullFetch = !task.subtasks || !task.description || !task.markdown_description;
+
+                                        let finalTask = task;
+                                        if (needsFullFetch) {
+                                            try {
+                                                const fullTaskResponse = await this.getTask(task.id);
+                                                // Handle both wrapped and unwrapped responses
+                                                finalTask = fullTaskResponse?.task || fullTaskResponse || task;
+                                                totalTasksProcessed++;
+
+                                                // Small delay to respect rate limits
+                                                await new Promise(resolve => setTimeout(resolve, 100));
+                                            } catch (error: any) {
+                                                // Check if this is a rate limit error
+                                                if (error.isRateLimit) {
+                                                    console.log(`⚠️  Rate limited! Folder: ${folder.name}, List: ${list.name}, Tasks in list: ${taskIndex + 1}/${listTaskCount}, Total processed: ${totalTasksProcessed}`);
+                                                }
+                                                // If full task fetch fails, use the bulk task data
+                                                finalTask = task;
+                                                totalTasksProcessed++;
+                                            }
+                                        } else {
+                                            // Use the bulk task data directly - it has everything we need
+                                            totalTasksProcessed++;
+                                        }
+
+                                        // Call callback if provided, otherwise just process
+                                        if (onTask && finalTask) {
+                                            await onTask(finalTask);
+                                        }
+                                    }
+                                }
+                                totalListsProcessed++;
+                            } catch (error: any) {
+                                if (error.isRateLimit) {
+                                    console.log(`⚠️  Rate limited! Folder: ${folder.name}, List: ${list.name}, Total processed: ${totalTasksProcessed}`);
+                                }
+                                console.error(`Error fetching tasks from list ${list.id}: ${error}`);
+                            }
+                        }
+                    } catch (error: any) {
+                        if (error.isRateLimit) {
+                            console.log(`⚠️  Rate limited! Folder: ${folder.name}, Total processed: ${totalTasksProcessed}`);
+                        }
+                        console.error(`Error fetching lists from folder ${folder.id}: ${error}`);
+                    }
+                }
+            } catch (error: any) {
+                if (error.isRateLimit) {
+                    console.log(`⚠️  Rate limited! Total processed: ${totalTasksProcessed}`);
+                }
+                // Folders endpoint failed, continue
+            }
+        } catch (error) {
+            console.error(`Error fetching tasks from space ${spaceId}: ${error}`);
         }
     }
 
@@ -394,4 +543,6 @@ export type {
     ClickUpView,
     ClickUpDocument,
 };
+
+
 
