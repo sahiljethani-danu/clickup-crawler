@@ -307,83 +307,35 @@ export class ClickUpCrawler {
     }
   }
 
-  private async exportTasksAsCSV(spaceId: string, spacePath: string, spaceName: string): Promise<void> {
-    const csvPath = join(spacePath, `tasks.csv`);
-    let headerWritten = false;
-    let allFieldNames = new Set<string>();
-    let taskCount = 0;
-
+  /**
+   * Export tasks organized by their folder/list structure
+   * Each list gets its own CSV file in the appropriate folder
+   */
+  private async exportTasksByFolder(spaceId: string, spacePath: string, spaceName: string): Promise<void> {
     try {
-      console.log(`  Fetching tasks...`);
+      console.log(`  Fetching task lists and tasks...`);
+      let totalTasks = 0;
+      let totalLists = 0;
 
-      // Create a callback function to write tasks incrementally
-      const writeTask = async (task: any) => {
-        const taskFields = getFieldNames(task);
-        const fieldsBefore = new Set(allFieldNames);
-
-        // Merge new fields into the set of all fields
-        taskFields.forEach(field => allFieldNames.add(field));
-
-        // Check if we discovered new fields
-        const hasNewFields = Array.from(allFieldNames).some(field => !fieldsBefore.has(field));
-
-        // Write or update header
-        if (!headerWritten) {
-          // First task - write header
-          const sortedFields = Array.from(allFieldNames).sort();
-          const header = sortedFields.map(escapeCSV).join(",");
-          await writeFile(csvPath, header + "\n", "utf-8");
-          headerWritten = true;
-        } else if (hasNewFields) {
-          // New fields discovered - update header by reading current file, updating header, and rewriting
-          // Note: This is a compromise - we read the file but don't keep tasks in memory
-          const fs = await import("fs/promises");
-          const currentContent = await fs.readFile(csvPath, "utf-8");
-          const lines = currentContent.split("\n");
-          const sortedFields = Array.from(allFieldNames).sort();
-          const newHeader = sortedFields.map(escapeCSV).join(",");
-          // Replace first line (header) with new header
-          lines[0] = newHeader;
-          await writeFile(csvPath, lines.join("\n") + "\n", "utf-8");
-        }
-
-        // Write task row with all known fields (missing fields will be empty)
-        // This ensures all rows have the same number of columns
-        const sortedFields = Array.from(allFieldNames).sort();
-        const row = objectToCSVRow(task, sortedFields);
-        await appendFile(csvPath, row + "\n", "utf-8");
-
-        taskCount++;
-      };
-
-      // Fetch tasks and write them incrementally
-      await this.client.getAllTasksInSpace(spaceId, writeTask);
-
-      if (taskCount === 0) {
-        console.log(`  ℹ️  No tasks found in this space`);
-        // Remove empty file if no tasks
-        if (headerWritten) {
-          await writeFile(csvPath, "", "utf-8");
-        }
-        return;
+      // Structure to hold lists by folder
+      interface ListWithFolder {
+        list: ClickUpList;
+        folderName: string | null;
+        folderId: string | null;
       }
 
-      console.log(`  ✓ Found and saved ${taskCount} task(s) to ${csvPath}`);
-    } catch (error) {
-      console.error(`  Error exporting tasks: ${error}`);
-      // Don't throw - continue with other exports
-    }
-  }
+      const listsWithFolders: ListWithFolder[] = [];
 
-  private async exportListsAsCSV(spaceId: string, spacePath: string, spaceName: string): Promise<void> {
-    try {
-      console.log(`  Fetching task lists...`);
-      const allLists: ClickUpList[] = [];
-
-      // Get lists directly in space
+      // Get lists directly in space (no folder)
       try {
         const { lists: spaceLists } = await this.client.getListsInSpace(spaceId);
-        allLists.push(...spaceLists);
+        for (const list of spaceLists) {
+          listsWithFolders.push({
+            list,
+            folderName: null,
+            folderId: null
+          });
+        }
       } catch (error) {
         console.error(`  Error fetching space lists: ${error}`);
       }
@@ -394,29 +346,73 @@ export class ClickUpCrawler {
         for (const folder of folders) {
           try {
             const { lists } = await this.client.getLists(folder.id);
-            allLists.push(...lists);
+            for (const list of lists) {
+              listsWithFolders.push({
+                list,
+                folderName: folder.name,
+                folderId: folder.id
+              });
+            }
           } catch (error) {
             console.error(`  Error fetching lists from folder ${folder.id}: ${error}`);
           }
         }
-      } catch (error) {
+      } catch {
         // Folders endpoint failed, continue
       }
 
-      if (allLists.length === 0) {
+      if (listsWithFolders.length === 0) {
         console.log(`  ℹ️  No task lists found in this space`);
         return;
       }
 
-      console.log(`  ✓ Found ${allLists.length} task list(s)`);
+      console.log(`  Found ${listsWithFolders.length} task list(s)`);
 
-      // Save lists as CSV
-      const csvContent = objectsToCSV(allLists);
-      const csvPath = join(spacePath, `task_lists.csv`);
-      await writeFile(csvPath, csvContent, "utf-8");
-      console.log(`  ✓ Saved task lists to ${csvPath}`);
+      // Process each list and save tasks in appropriate folder
+      for (const { list, folderName } of listsWithFolders) {
+        try {
+          // Determine the target path based on folder
+          let targetPath = spacePath;
+          if (folderName) {
+            targetPath = join(spacePath, this.sanitizeFileName(folderName));
+            await this.ensureDirectory(targetPath);
+          }
+
+          // Create a CSV file for this list
+          const listFileName = this.sanitizeFileName(list.name) + '_tasks.csv';
+          const csvPath = join(targetPath, listFileName);
+
+          // Fetch tasks for this list
+          const { tasks } = await this.client.getTasks(list.id, true);
+          
+          if (!tasks || tasks.length === 0) {
+            continue;
+          }
+
+          // Convert tasks to CSV
+          const csvContent = objectsToCSV(tasks);
+          await writeFile(csvPath, csvContent, "utf-8");
+          
+          const locationInfo = folderName ? `${folderName}/${list.name}` : list.name;
+          console.log(`    ✓ ${tasks.length} task(s) → ${locationInfo}`);
+          
+          totalTasks += tasks.length;
+          totalLists++;
+
+          // Small delay to respect rate limits
+          await new Promise(resolve => setTimeout(resolve, 100));
+        } catch (error) {
+          console.error(`  Error exporting tasks for list ${list.name}: ${error}`);
+        }
+      }
+
+      if (totalTasks > 0) {
+        console.log(`  ✓ Saved ${totalTasks} task(s) across ${totalLists} list(s)`);
+      } else {
+        console.log(`  ℹ️  No tasks found in this space`);
+      }
     } catch (error) {
-      console.error(`  Error exporting task lists: ${error}`);
+      console.error(`  Error exporting tasks: ${error}`);
       // Don't throw - continue with other exports
     }
   }
@@ -434,10 +430,9 @@ export class ClickUpCrawler {
     await this.ensureDirectory(spacePath);
 
     try {
-      // Export tasks and task lists as CSV if requested
+      // Export tasks organized by folder/list structure if requested
       if (includeTasks) {
-        await this.exportTasksAsCSV(spaceId, spacePath, spaceName);
-        await this.exportListsAsCSV(spaceId, spacePath, spaceName);
+        await this.exportTasksByFolder(spaceId, spacePath, spaceName);
       }
 
       // Get all documents in the space if requested
@@ -451,28 +446,38 @@ export class ClickUpCrawler {
         } else {
           console.log(`  ✓ Found ${documents.length} document(s)`);
 
-          // Fetch full content for each document
+          // Documents are already fully fetched with pages from getDocuments()
+          // Just need to re-fetch any that are missing pages
           const documentsWithContent: ClickUpDocument[] = [];
           for (const doc of documents) {
             try {
-              const { document, pages } = await this.client.getDocument(doc.id, workspaceId);
-              document.pages = pages;
-              documentsWithContent.push(document);
-              console.log(`  Fetched: ${document.name} (${pages.length} page(s))`);
-              // Small delay to respect rate limits (100 requests/minute = ~600ms between requests)
-              await this.delay(600);
+              // Check if document already has pages (fetched by getDocuments)
+              if (doc.pages && doc.pages.length > 0) {
+                documentsWithContent.push(doc);
+                console.log(`  Fetched: ${doc.name} (${doc.pages.length} page(s))`);
+              } else {
+                // Re-fetch if pages are missing
+                const { document, pages } = await this.client.getDocument(doc.id, workspaceId);
+                document.pages = pages;
+                documentsWithContent.push(document);
+                console.log(`  Fetched: ${document.name} (${pages.length} page(s))`);
+                // Small delay to respect rate limits
+                await this.delay(300);
+              }
             } catch (error) {
               console.error(`  Error fetching document ${doc.id}: ${error}`);
-              throw error; // Re-throw to fail fast
+              // Continue with other documents instead of failing completely
+              continue;
             }
           }
 
-          // Build document tree
+          // Build document tree from the flattened list
           const rootNodes = this.buildDocumentTree(documentsWithContent);
 
-          // Process each root document (now saves pages separately)
+          // Process each root document (saves pages separately)
           for (const rootNode of rootNodes) {
             // Convert ClickUpDocument to DocumentNode for compatibility
+            const sourceDoc = documentsWithContent.find(d => d.id === rootNode.id);
             const node: DocumentNode = {
               id: rootNode.id,
               name: rootNode.name,
@@ -480,9 +485,18 @@ export class ClickUpCrawler {
               content: rootNode.content,
               children: rootNode.children,
               parentId: rootNode.parentId,
-              pages: documentsWithContent.find(d => d.id === rootNode.id)?.pages
+              pages: sourceDoc?.pages
             };
-            await this.processDocumentNode(node, spacePath, spaceName);
+
+            // Determine the correct path based on folder hierarchy
+            let targetPath = spacePath;
+            if ((sourceDoc as any)?.folderName) {
+              const folderPath = join(spacePath, this.sanitizeFileName((sourceDoc as any).folderName));
+              await this.ensureDirectory(folderPath);
+              targetPath = folderPath;
+            }
+
+            await this.processDocumentNode(node, targetPath, spaceName);
           }
         }
       }
